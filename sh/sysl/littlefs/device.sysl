@@ -1,6 +1,6 @@
 module sh.sysl.littlefs
 
-import sysl.buf.{Buf, buf}
+import sysl.buf.{Buf, buf_filled}
 import sysl.slices.copy
 
 // Flash in memory, for tests and RAM disks. Unlike the rest of the package it allocates: its blocks are
@@ -21,10 +21,7 @@ struct RamDevice
 
 // An erased device of `block_count` blocks of `block_size` bytes.
 ram_device(block_size: u32, block_count: u32) -> RamDevice
-    var bytes: Buf[u8] = buf()
-    for _ in 0..<usize(block_size) * usize(block_count)
-        bytes.push(0xff)
-    RamDevice(bytes, block_size, block_count)
+    RamDevice(buf_filled(usize(block_size) * usize(block_count), u8(0xff)), block_size, block_count)
 
 impl BlockDevice for RamDevice
     read(*self, block: u32, offset: u32, out: []u8) -> Result[unit, DeviceError]
