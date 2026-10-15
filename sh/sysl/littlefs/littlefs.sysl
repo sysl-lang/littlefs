@@ -1,0 +1,441 @@
+module sh.sysl.littlefs
+
+import sh.sysl.littlefs.c
+import sysl.slices.{as_mut_ptr, as_ptr}
+import sysl.text.str_view
+
+// A filesystem for the flash on a microcontroller, bound to littlefs: every update is copy-on-write
+// and commits atomically, so losing power in the middle of a write leaves the old version or the new
+// one and never a broken filesystem; and writes are spread over the blocks, since flash wears out.
+//
+// Nothing here allocates. The filesystem's caches, its lookahead bitmap and each open file's cache are
+// arrays inside the sysl values that own them, sized by their type parameters, so a board with no heap
+// declares them as module storage and is done.
+//
+// **A mounted filesystem, an open file and an open directory must stay where they are.** littlefs keeps
+// their addresses: the filesystem points at its own configuration and at a list running through every
+// open file. So each is reached through a pointer once it is in use (`*Fs`, `*File`, `*Dir`), and a copy
+// of one taken after `mount` or `open` is a copy littlefs knows nothing about.
+
+// The flash a filesystem lives on, in littlefs's terms: blocks that are erased whole, programmed and
+// read in pieces of `read_size` and `prog_size` bytes. littlefs only programs a block it has erased.
+trait BlockDevice
+    // Copy `out.len` bytes starting `offset` bytes into `block`.
+    read(*self, block: u32, offset: u32, out: []u8) -> Result[unit, DeviceError]
+
+    // Write `data` starting `offset` bytes into `block`, which has been erased since it was last
+    // written.
+    prog(*self, block: u32, offset: u32, data: []const u8) -> Result[unit, DeviceError]
+
+    // Erase `block`.
+    erase(*self, block: u32) -> Result[unit, DeviceError]
+
+    // Everything programmed before this is durable once it returns.
+    sync(*self) -> Result[unit, DeviceError]
+
+// What a device answers when it cannot do what was asked.
+enum DeviceError derives Display
+    // The operation failed. littlefs passes this on as `Error.Io`.
+    Io
+
+    // The block has worn out. littlefs stops using it and carries on elsewhere.
+    BadBlock
+
+// Why a filesystem operation failed.
+enum Error derives Eq, Display
+    Io
+    Corrupt
+    NotFound
+    Exists
+    NotADirectory
+    IsADirectory
+    NotEmpty
+    BadHandle
+    TooLarge
+    Invalid
+    NoSpace
+    NoMemory
+    NoAttribute
+    NameTooLong
+
+    // A path longer than `MAX_PATH` bytes, which is the room the binding keeps to hand littlefs a
+    // NUL-terminated copy.
+    PathTooLong
+
+    // A code this binding does not know, from a littlefs newer than the one it was written against.
+    Unknown(code: int)
+
+// The longest path the filesystem accepts, in bytes. littlefs itself limits each name to `NAME_MAX`
+// bytes and puts no limit on a path; this leaves room for a name of the longest kind a directory or
+// two down.
+const MAX_PATH: usize = 511
+
+// The longest name of one entry, in bytes.
+const NAME_MAX: usize = 255
+
+// How a file is opened: one of `READ`, `WRITE` or `READ_WRITE`, with any of the others.
+const READ: int = c.O_RDONLY
+const WRITE: int = c.O_WRONLY
+const READ_WRITE: int = c.O_RDWR
+const CREATE: int = c.O_CREAT
+const EXCLUSIVE: int = c.O_EXCL
+const TRUNCATE: int = c.O_TRUNC
+const APPEND: int = c.O_APPEND
+
+// Where a seek counts from.
+enum Whence
+    Start
+    Current
+    End
+
+// The device's shape and how hard littlefs should work to spread wear. `block_size` must be a multiple
+// of `read_size` and `prog_size`. `block_cycles` is how many erases a metadata block takes before
+// littlefs moves it (100 to 1000 is usual), or -1 to leave wear levelling off.
+struct Geometry
+    read_size: u32
+    prog_size: u32
+    block_size: u32
+    block_count: u32
+    block_cycles: i32
+
+private[littlefs] const LFS_WORDS: usize = (c.LFS_SIZE + 7) / 8
+private[littlefs] const FILE_WORDS: usize = (c.FILE_SIZE + 7) / 8
+private[littlefs] const DIR_WORDS: usize = (c.DIR_SIZE + 7) / 8
+
+// One entry of a directory, or what `stat` found.
+struct Info
+    private raw: c.Info
+
+    // The entry's name, without its directory.
+    name(*self) -> string
+        var n = 0usize
+        while n < self.raw.name.len && self.raw.name[n] != 0
+            n += 1
+        str_view(self.raw.name[0..<n])
+
+    // Its size in bytes; 0 for a directory.
+    size(self) -> u32 = self.raw.size
+
+    is_dir(self) -> bool = self.raw.kind == c.TYPE_DIR
+
+// An empty `Info`, for `read_dir` to fill.
+info() -> Info = Info(c.Info(0, 0, [0; 256]))
+
+// What a mounted filesystem says about itself.
+struct FsInfo
+    disk_version: u32
+    block_size: u32
+    block_count: u32
+    name_max: u32
+    file_max: u32
+    attr_max: u32
+
+// An open file. `CACHE` must be the filesystem's, which the type checks: a file is opened by an
+// `Fs[D, CACHE, L]` only if it is a `File[CACHE]`.
+struct File[const CACHE: usize]
+    private state: [FILE_WORDS]u64
+    private cache: [CACHE]u8
+    private config: c.FileConfig
+    private open: bool
+    private flags: int
+
+    private readable(self) -> bool = self.open && self.flags & READ != 0
+
+    private writable(self) -> bool = self.open && self.flags & WRITE != 0
+
+// A file that is not open yet.
+file[const CACHE: usize]() -> File[CACHE] = File([0; FILE_WORDS], [0; CACHE], c.FileConfig(null, null, 0), false, 0)
+
+// An open directory, read one entry at a time.
+struct Dir
+    private state: [DIR_WORDS]u64
+    private open: bool
+
+// A directory that is not open yet.
+dir() -> Dir = Dir([0; DIR_WORDS], false)
+
+// A littlefs filesystem on the device `dev`. `CACHE` is the size of each of the read and program
+// caches and of every open file's cache: a multiple of the read and program sizes that divides the
+// block size. `LOOKAHEAD` is the size of the allocator's bitmap, a multiple of 8; each byte covers 8
+// blocks.
+struct Fs[D: BlockDevice, const CACHE: usize, const LOOKAHEAD: usize]
+    private state: [LFS_WORDS]u64
+    private config: c.Config
+    private read_cache: [CACHE]u8
+    private prog_cache: [CACHE]u8
+    private lookahead: [LOOKAHEAD]u8
+    private path: [MAX_PATH + 1]u8
+    private second_path: [MAX_PATH + 1]u8
+    private dev: *D
+    private geometry: Geometry
+    private mounted: bool
+
+    // Write an empty filesystem over the whole device. The filesystem is left unmounted.
+    format(*self) -> Result[unit, Error]
+        if self.mounted then return Err(Error.Invalid)
+        self.configure()?
+        check(c.format(self.lfs(), &self.config))
+
+    // Mount the filesystem already on the device.
+    mount(*self) -> Result[unit, Error]
+        if self.mounted then return Err(Error.Invalid)
+        self.configure()?
+        check(c.mount(self.lfs(), &self.config))?
+        self.mounted = true
+        Ok(())
+
+    // Unmount it. Files still open are not written: close them first.
+    unmount(*self) -> Result[unit, Error]
+        val lfs = self.live()?
+        self.mounted = false
+        check(c.unmount(lfs))
+
+    is_mounted(self) -> bool = self.mounted
+
+    // Make a directory.
+    mkdir(*self, path: string) -> Result[unit, Error]
+        val p = self.first(path)?
+        check(c.mkdir(self.live()?, p))
+
+    // Remove a file, or a directory that is empty.
+    remove(*self, path: string) -> Result[unit, Error]
+        val p = self.first(path)?
+        check(c.remove(self.live()?, p))
+
+    // Rename or move an entry, replacing whatever `to` named (a directory only if it is empty).
+    rename(*self, from: string, to: string) -> Result[unit, Error]
+        val a = self.first(from)?
+        val b = self.second(to)?
+        check(c.rename(self.live()?, a, b))
+
+    // What is at `path`.
+    stat(*self, path: string) -> Result[Info, Error]
+        val p = self.first(path)?
+        var out = info()
+        check(c.stat(self.live()?, p, &out.raw))?
+        Ok(out)
+
+    // Whether anything is at `path`.
+    exists(*self, path: string) -> Result[bool, Error]
+        self.stat(path) match
+            Ok(_) -> Ok(true)
+            Err(Error.NotFound) -> Ok(false)
+            Err(e) -> Err(e)
+
+    // How many blocks are in use. littlefs counts them by walking the filesystem, so this takes time
+    // in proportion to its size.
+    used_blocks(*self) -> Result[u32, Error] = count(c.fs_size(self.live()?))
+
+    // What the mounted filesystem says about itself.
+    fs_info(*self) -> Result[FsInfo, Error]
+        var out = c.FsInfo(0, 0, 0, 0, 0, 0)
+        check(c.fs_stat(self.live()?, &out))?
+        Ok(FsInfo(out.disk_version, out.block_size, out.block_count, out.name_max, out.file_max, out.attr_max))
+
+    // Do now the housekeeping littlefs would otherwise do in the middle of a later write: finish
+    // compacting metadata and fill the allocator's lookahead.
+    gc(*self) -> Result[unit, Error] = check(c.fs_gc(self.live()?))
+
+    // Grow the filesystem to `block_count` blocks, after the device has grown.
+    grow(*self, block_count: u32) -> Result[unit, Error]
+        if block_count < self.geometry.block_count then return Err(Error.Invalid)
+        check(c.fs_grow(self.live()?, block_count))?
+        self.geometry.block_count = block_count
+        Ok(())
+
+    // Read the attribute `kind` of the entry at `path` into `out`, answering its length. One that is
+    // longer than `out` is cut short.
+    get_attribute(*self, path: string, kind: u8, out: []u8) -> Result[usize, Error]
+        val p = self.first(path)?
+        val n = count(c.getattr(self.live()?, p, kind, as_mut_ptr(out), u32(out.len)))?
+        Ok(usize(n))
+
+    // Set the attribute `kind` of the entry at `path`, up to `ATTR_MAX` bytes.
+    set_attribute(*self, path: string, kind: u8, data: []const u8) -> Result[unit, Error]
+        val p = self.first(path)?
+        check(c.setattr(self.live()?, p, kind, as_ptr(data), u32(data.len)))
+
+    remove_attribute(*self, path: string, kind: u8) -> Result[unit, Error]
+        val p = self.first(path)?
+        check(c.removeattr(self.live()?, p, kind))
+
+    // Open the file at `path` into `f`, with `flags` (`READ`, `WRITE`, `READ_WRITE`, with any of
+    // `CREATE`, `EXCLUSIVE`, `TRUNCATE`, `APPEND`). `f` stays where it is until it is closed.
+    open(*self, f: *File[CACHE], path: string, flags: int) -> Result[unit, Error]
+        if f.open then return Err(Error.BadHandle)
+        if flags & READ_WRITE == 0 then return Err(Error.Invalid)
+        val p = self.first(path)?
+        f.config = c.FileConfig(&f.cache[0], null, 0)
+        check(c.file_opencfg(self.live()?, ptr_cast(&f.state[0]), p, flags, &f.config))?
+        f.open = true
+        f.flags = flags
+        Ok(())
+
+    // Write what is buffered in `f` and close it.
+    close(*self, f: *File[CACHE]) -> Result[unit, Error]
+        if !f.open then return Err(Error.BadHandle)
+        f.open = false
+        check(c.file_close(self.live()?, self.handle(f)))
+
+    // Write what is buffered in `f`, keeping it open.
+    flush(*self, f: *File[CACHE]) -> Result[unit, Error]
+        if !f.open then return Err(Error.BadHandle)
+        check(c.file_sync(self.live()?, self.handle(f)))
+
+    // Read into `out` from where `f` is, answering how many bytes came: fewer than asked only at the
+    // end of the file.
+    read(*self, f: *File[CACHE], out: []u8) -> Result[usize, Error]
+        if !f.readable() then return Err(Error.BadHandle)
+        val n = count(c.file_read(self.live()?, self.handle(f), as_mut_ptr(out), u32(out.len)))?
+        Ok(usize(n))
+
+    // Write `data` where `f` is, answering how many bytes went.
+    write(*self, f: *File[CACHE], data: []const u8) -> Result[usize, Error]
+        if !f.writable() then return Err(Error.BadHandle)
+        val n = count(c.file_write(self.live()?, self.handle(f), as_ptr(data), u32(data.len)))?
+        Ok(usize(n))
+
+    // Move `f` to `offset` bytes from `whence`, answering where it is now.
+    seek(*self, f: *File[CACHE], offset: i32, whence: Whence = Whence.Start) -> Result[u32, Error]
+        if !f.open then return Err(Error.BadHandle)
+        val w = whence match
+            Whence.Start -> c.SEEK_SET
+            Whence.Current -> c.SEEK_CUR
+            Whence.End -> c.SEEK_END
+        count(c.file_seek(self.live()?, self.handle(f), offset, w))
+
+    // Where `f` is.
+    tell(*self, f: *File[CACHE]) -> Result[u32, Error]
+        if !f.open then return Err(Error.BadHandle)
+        count(c.file_tell(self.live()?, self.handle(f)))
+
+    // How long the file is.
+    size(*self, f: *File[CACHE]) -> Result[u32, Error]
+        if !f.open then return Err(Error.BadHandle)
+        count(c.file_size(self.live()?, self.handle(f)))
+
+    // Cut the file to `size` bytes, or extend it with zeros.
+    truncate(*self, f: *File[CACHE], size: u32) -> Result[unit, Error]
+        if !f.writable() then return Err(Error.BadHandle)
+        check(c.file_truncate(self.live()?, self.handle(f), size))
+
+    // Open the directory at `path` into `d`. `d` stays where it is until it is closed.
+    open_dir(*self, d: *Dir, path: string) -> Result[unit, Error]
+        if d.open then return Err(Error.BadHandle)
+        val p = self.first(path)?
+        check(c.dir_open(self.live()?, ptr_cast(&d.state[0]), p))?
+        d.open = true
+        Ok(())
+
+    // Fill `out` with the next entry, answering false at the end. `.` and `..` come first.
+    read_dir(*self, d: *Dir, out: *Info) -> Result[bool, Error]
+        if !d.open then return Err(Error.BadHandle)
+        val r = c.dir_read(self.live()?, ptr_cast(&d.state[0]), &out.raw)
+        if r < 0 then Err(error(r)) else Ok(r > 0)
+
+    // Start `d` over from its first entry.
+    rewind_dir(*self, d: *Dir) -> Result[unit, Error]
+        if !d.open then return Err(Error.BadHandle)
+        check(c.dir_rewind(self.live()?, ptr_cast(&d.state[0])))
+
+    close_dir(*self, d: *Dir) -> Result[unit, Error]
+        if !d.open then return Err(Error.BadHandle)
+        d.open = false
+        check(c.dir_close(self.live()?, ptr_cast(&d.state[0])))
+
+    private lfs(*self) -> *c.Lfs = ptr_cast(&self.state[0])
+
+    // littlefs's state, for an operation that needs the filesystem mounted.
+    private live(*self) -> Result[*c.Lfs, Error] = if self.mounted then Ok(self.lfs()) else Err(Error.Invalid)
+
+    private handle(*self, f: *File[CACHE]) -> *c.File = ptr_cast(&f.state[0])
+
+    // Fill in littlefs's configuration, pointing it at this value's own buffers and device. littlefs
+    // checks most of this itself only by assertion, which the package compiles out, so what it would
+    // assert is checked here.
+    private configure(*self) -> Result[unit, Error]
+        val g = self.geometry
+        if g.read_size == 0 || g.prog_size == 0 || g.block_size < 128 || g.block_count == 0 then
+            return Err(Error.Invalid)
+        if g.block_cycles == 0 then return Err(Error.Invalid)
+        val cache = u32(CACHE)
+        if cache == 0 || cache % g.read_size != 0 || cache % g.prog_size != 0 || g.block_size % cache != 0 then
+            return Err(Error.Invalid)
+        if LOOKAHEAD == 0 || LOOKAHEAD % 8 != 0 then return Err(Error.Invalid)
+        self.config = c.Config(
+            ptr_cast(self.dev),
+            &read_block[D], &prog_block[D], &erase_block[D], &sync_device[D],
+            g.read_size, g.prog_size, g.block_size, g.block_count, g.block_cycles,
+            cache, u32(LOOKAHEAD), 0,
+            &self.read_cache[0], &self.prog_cache[0], &self.lookahead[0],
+            0, 0, 0, 0, 0)
+        Ok(())
+
+    private first(*self, path: string) -> Result[*u8, Error] = terminated(path, self.path[..])
+
+    private second(*self, path: string) -> Result[*u8, Error] = terminated(path, self.second_path[..])
+end Fs
+
+// A filesystem on `dev`, not yet formatted or mounted. It may be moved until it is mounted.
+filesystem[D: BlockDevice, const CACHE: usize, const LOOKAHEAD: usize](dev: *D, geometry: Geometry) -> Fs[D, CACHE, LOOKAHEAD]
+    Fs([0; LFS_WORDS], empty_config(), [0; CACHE], [0; CACHE], [0; LOOKAHEAD], [0; MAX_PATH + 1],
+       [0; MAX_PATH + 1], dev, geometry, false)
+
+private empty_config() -> c.Config
+    c.Config(null, null, null, null, null, 0, 0, 0, 0, 0, 0, 0, 0, null, null, null, 0, 0, 0, 0, 0)
+
+// `path` copied into `into` with a NUL after it, for littlefs.
+private terminated(path: string, into: []u8) -> Result[*u8, Error]
+    if path.len >= into.len then return Err(Error.PathTooLong)
+    for i in 0..<path.len
+        if path[i] == 0 then return Err(Error.Invalid)
+        into[i] = path[i]
+    into[path.len] = 0
+    Ok(&into[0])
+
+// The four functions littlefs calls, one instantiation per device type. Each finds its device through
+// the configuration's `context`.
+
+private read_block[D: BlockDevice](config: *c.Config, block: u32, offset: u32, buffer: *u8, size: u32) -> i32
+    var dev: *D = ptr_cast(config.context)
+    status(dev.read(block, offset, buffer[0..<usize(size)]))
+
+private prog_block[D: BlockDevice](config: *c.Config, block: u32, offset: u32, buffer: *u8, size: u32) -> i32
+    var dev: *D = ptr_cast(config.context)
+    status(dev.prog(block, offset, buffer[0..<usize(size)]))
+
+private erase_block[D: BlockDevice](config: *c.Config, block: u32) -> i32
+    var dev: *D = ptr_cast(config.context)
+    status(dev.erase(block))
+
+private sync_device[D: BlockDevice](config: *c.Config) -> i32
+    var dev: *D = ptr_cast(config.context)
+    status(dev.sync())
+
+private status(r: Result[unit, DeviceError]) -> i32
+    r match
+        Ok(_) -> 0
+        Err(DeviceError.Io) -> c.ERR_IO
+        Err(DeviceError.BadBlock) -> c.ERR_CORRUPT
+
+private check(code: int) -> Result[unit, Error] = if code < 0 then Err(error(code)) else Ok(())
+
+private count(code: i32) -> Result[u32, Error] = if code < 0 then Err(error(code)) else Ok(u32(code))
+
+// The error a negative littlefs code stands for.
+private error(code: int) -> Error
+    if code == c.ERR_IO then Error.Io
+    else if code == c.ERR_CORRUPT then Error.Corrupt
+    else if code == c.ERR_NOENT then Error.NotFound
+    else if code == c.ERR_EXIST then Error.Exists
+    else if code == c.ERR_NOTDIR then Error.NotADirectory
+    else if code == c.ERR_ISDIR then Error.IsADirectory
+    else if code == c.ERR_NOTEMPTY then Error.NotEmpty
+    else if code == c.ERR_BADF then Error.BadHandle
+    else if code == c.ERR_FBIG then Error.TooLarge
+    else if code == c.ERR_INVAL then Error.Invalid
+    else if code == c.ERR_NOSPC then Error.NoSpace
+    else if code == c.ERR_NOMEM then Error.NoMemory
+    else if code == c.ERR_NOATTR then Error.NoAttribute
+    else if code == c.ERR_NAMETOOLONG then Error.NameTooLong
+    else Error.Unknown(code)

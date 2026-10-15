@@ -1,0 +1,49 @@
+module sh.sysl.littlefs
+
+import sysl.buf.{Buf, buf}
+import sysl.slices.copy
+
+// Flash in memory, for tests and RAM disks. Unlike the rest of the package it allocates: its blocks are
+// one `Buf`. It behaves as NOR flash does, so it catches a filesystem that programs a block it has not
+// erased: erasing sets every byte to 0xff, and programming can only clear bits.
+struct RamDevice
+    private bytes: Buf[u8]
+    private block_size: u32
+    private block_count: u32
+
+    // Every byte the device holds, for a test that looks at the raw image.
+    image(self) -> []const u8 = self.bytes.view()
+
+    private at(self, block: u32, offset: u32, len: usize) -> Result[usize, DeviceError]
+        if block >= self.block_count || usize(offset) + len > usize(self.block_size) then
+            return Err(DeviceError.Io)
+        Ok(usize(block) * usize(self.block_size) + usize(offset))
+
+// An erased device of `block_count` blocks of `block_size` bytes.
+ram_device(block_size: u32, block_count: u32) -> RamDevice
+    var bytes: Buf[u8] = buf()
+    for _ in 0..<usize(block_size) * usize(block_count)
+        bytes.push(0xff)
+    RamDevice(bytes, block_size, block_count)
+
+impl BlockDevice for RamDevice
+    read(*self, block: u32, offset: u32, out: []u8) -> Result[unit, DeviceError]
+        val at = self.at(block, offset, out.len)?
+        copy(out, self.bytes.view()[at..<at + out.len])
+        Ok(())
+
+    prog(*self, block: u32, offset: u32, data: []const u8) -> Result[unit, DeviceError]
+        val at = self.at(block, offset, data.len)?
+        val bytes = self.bytes.view()
+        for i in 0..<data.len
+            bytes[at + i] &= data[i]
+        Ok(())
+
+    erase(*self, block: u32) -> Result[unit, DeviceError]
+        val at = self.at(block, 0, usize(self.block_size))?
+        val bytes = self.bytes.view()
+        for i in at..<at + usize(self.block_size)
+            bytes[i] = 0xff
+        Ok(())
+
+    sync(*self) -> Result[unit, DeviceError] = Ok(())

@@ -1,0 +1,170 @@
+module sh.sysl.littlefs
+@tests
+@requires(heap, os)
+
+import sysl.fs.{make_temp_dir, read_bytes, remove_dir_all, write_text}
+import sysl.process.capture
+
+// The binding against littlefs driven from C. A program written straight against `lfs.h`, compiled from
+// the same vendored source with the same options, runs a sequence of operations over a RAM device of
+// the same shape, and the binding runs the same sequence. littlefs is deterministic, so the two images
+// must be the same bytes. A configuration field the binding put in the wrong place, a flag constant it
+// got wrong or a buffer of the wrong size all change the image.
+
+private val DRIVER: string = raw"""
+    #include <stdio.h>
+    #include <string.h>
+    #include "lfs.h"
+
+    static unsigned char flash[512 * 256];
+    static unsigned long reads, read_bytes, progs, prog_bytes, erases;
+
+    static int rd(const struct lfs_config *c, lfs_block_t b, lfs_off_t o, void *buf, lfs_size_t n) {
+        reads++;
+        read_bytes += n;
+        memcpy(buf, flash + b * 512 + o, n);
+        return 0;
+    }
+    static int pg(const struct lfs_config *c, lfs_block_t b, lfs_off_t o, const void *buf, lfs_size_t n) {
+        progs++;
+        prog_bytes += n;
+        for (lfs_size_t i = 0; i < n; i++) flash[b * 512 + o + i] &= ((const unsigned char *)buf)[i];
+        return 0;
+    }
+    static int er(const struct lfs_config *c, lfs_block_t b) {
+        erases++;
+        memset(flash + b * 512, 0xff, 512);
+        return 0;
+    }
+    static int sy(const struct lfs_config *c) { return 0; }
+
+    static unsigned char rcache[64], pcache[64], look[16], fcache[64];
+
+    static unsigned char pattern(unsigned i) { return (unsigned char)((i * 31 + i / 251) % 256); }
+
+    int main(int argc, char **argv) {
+        memset(flash, 0xff, sizeof flash);
+        struct lfs_config cfg = {
+            .read = rd, .prog = pg, .erase = er, .sync = sy,
+            .read_size = 8, .prog_size = 16, .block_size = 512, .block_count = 256,
+            .block_cycles = 500, .cache_size = 64, .lookahead_size = 16,
+            .read_buffer = rcache, .prog_buffer = pcache, .lookahead_buffer = look,
+        };
+        struct lfs_file_config fcfg = { .buffer = fcache };
+        lfs_t lfs;
+        lfs_file_t f;
+        if (lfs_format(&lfs, &cfg) || lfs_mount(&lfs, &cfg)) return 2;
+        if (lfs_mkdir(&lfs, "docs")) return 3;
+        unsigned char chunk[77];
+        for (unsigned round = 0; round < 4; round++) {
+            if (lfs_file_opencfg(&lfs, &f, "docs/a.txt", LFS_O_WRONLY | LFS_O_CREAT | LFS_O_TRUNC, &fcfg)) return 4;
+            for (unsigned at = 0; at < 40000; at += 77) {
+                unsigned n = 40000 - at < 77 ? 40000 - at : 77;
+                for (unsigned i = 0; i < n; i++) chunk[i] = pattern(at + i + round);
+                if (lfs_file_write(&lfs, &f, chunk, n) != (lfs_ssize_t)n) return 5;
+            }
+            if (lfs_file_close(&lfs, &f)) return 6;
+        }
+        if (lfs_file_opencfg(&lfs, &f, "b", LFS_O_WRONLY | LFS_O_CREAT | LFS_O_EXCL, &fcfg)) return 7;
+        if (lfs_file_write(&lfs, &f, "hello", 5) != 5 || lfs_file_close(&lfs, &f)) return 8;
+        if (lfs_rename(&lfs, "b", "docs/b")) return 9;
+        if (lfs_setattr(&lfs, "docs/b", 7, "blue", 4)) return 10;
+        if (lfs_file_opencfg(&lfs, &f, "docs/a.txt", LFS_O_RDWR, &fcfg)) return 11;
+        if (lfs_file_seek(&lfs, &f, 100, LFS_SEEK_SET) != 100) return 12;
+        if (lfs_file_write(&lfs, &f, "patched", 7) != 7) return 13;
+        if (lfs_file_truncate(&lfs, &f, 1000) || lfs_file_close(&lfs, &f)) return 14;
+        if (lfs_mkdir(&lfs, "gone") || lfs_remove(&lfs, "gone")) return 15;
+        if (lfs_unmount(&lfs)) return 16;
+        FILE *out = fopen(argv[1], "wb");
+        if (!out || fwrite(flash, 1, sizeof flash, out) != sizeof flash || fclose(out)) return 17;
+        printf("%lu %lu %lu %lu %lu", reads, read_bytes, progs, prog_bytes, erases);
+        return 0;
+    }
+    """
+
+private val C_DIR: string = "sh/sysl/littlefs/c"
+
+// The RAM device, counting what littlefs asks of it. The image alone cannot see the cache or lookahead
+// sizes, since littlefs takes the next free block whatever its window; how often it reads can.
+private struct Traced
+    ram: RamDevice
+    reads: u64
+    read_bytes: u64
+    progs: u64
+    prog_bytes: u64
+    erases: u64
+
+impl BlockDevice for Traced
+    read(*self, block: u32, offset: u32, out: []u8) -> Result[unit, DeviceError]
+        self.reads += 1
+        self.read_bytes += u64(out.len)
+        self.ram.read(block, offset, out)
+
+    prog(*self, block: u32, offset: u32, data: []const u8) -> Result[unit, DeviceError]
+        self.progs += 1
+        self.prog_bytes += u64(data.len)
+        self.ram.prog(block, offset, data)
+
+    erase(*self, block: u32) -> Result[unit, DeviceError]
+        self.erases += 1
+        self.ram.erase(block)
+
+    sync(*self) -> Result[unit, DeviceError] = self.ram.sync()
+
+@test("the binding writes the same image, byte for byte, as littlefs driven from C, with the same device traffic")
+same_image_as_c()
+    val dir = make_temp_dir("littlefs-oracle-").unwrap()
+    val source = s"${dir}/driver.c"
+    val program = s"${dir}/driver"
+    val image = s"${dir}/image"
+    write_text(source, DRIVER).unwrap()
+    val built = capture("clang", ["-O1", "-I", C_DIR, "-DLFS_NO_MALLOC", "-DLFS_NO_DEBUG", "-DLFS_NO_WARN",
+                                  "-DLFS_NO_ERROR", "-DLFS_NO_ASSERT", "-o", program, source,
+                                  s"${C_DIR}/lfs.c", s"${C_DIR}/lfs_util.c"], stderr = true).unwrap()
+    assert(built.status.ok(), s"the C driver did not build: ${built.text}")
+    val ran = capture(program, [image], stderr = true).unwrap()
+    assert(ran.status.ok(), "the C driver failed")
+    val theirs = read_bytes(image).unwrap()
+
+    var dev = Traced(ram_device(512, 256), 0, 0, 0, 0, 0)
+    var fs: Fs[Traced, 64, 16] = filesystem(&dev, Geometry(8, 16, 512, 256, 500))
+    fs.format().unwrap()
+    fs.mount().unwrap()
+    fs.mkdir("docs").unwrap()
+    var f: File[64] = file()
+    var chunk: [77]u8 = [0; 77]
+    for round in 0..<4usize
+        fs.open(&f, "docs/a.txt", WRITE | CREATE | TRUNCATE).unwrap()
+        var at = 0usize
+        while at < 40000
+            val n = if 40000 - at < 77 then 40000 - at else 77
+            for i in 0..<n
+                val k = at + i + round
+                chunk[i] = u8((k * 31 + k / 251) % 256)
+            assert_eq(fs.write(&f, chunk[0..<n]).unwrap(), n)
+            at += n
+        fs.close(&f).unwrap()
+    fs.open(&f, "b", WRITE | CREATE | EXCLUSIVE).unwrap()
+    fs.write(&f, "hello".bytes).unwrap()
+    fs.close(&f).unwrap()
+    fs.rename("b", "docs/b").unwrap()
+    fs.set_attribute("docs/b", 7, "blue".bytes).unwrap()
+    fs.open(&f, "docs/a.txt", READ_WRITE).unwrap()
+    assert_eq(fs.seek(&f, 100).unwrap(), 100)
+    fs.write(&f, "patched".bytes).unwrap()
+    fs.truncate(&f, 1000).unwrap()
+    fs.close(&f).unwrap()
+    fs.mkdir("gone").unwrap()
+    fs.remove("gone").unwrap()
+    fs.unmount().unwrap()
+
+    assert_eq(s"${dev.reads} ${dev.read_bytes} ${dev.progs} ${dev.prog_bytes} ${dev.erases}", ran.text)
+    val ours = dev.ram.image()
+    assert_eq(ours.len, theirs.len)
+    var first_difference = -1
+    for i in 0..<ours.len
+        if ours[i] != theirs[i] then
+            first_difference = int(i)
+            break
+    assert_eq(first_difference, -1)
+    remove_dir_all(dir).unwrap()

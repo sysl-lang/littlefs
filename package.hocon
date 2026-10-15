@@ -1,0 +1,36 @@
+// littlefs for sysl: a small fail-safe filesystem for the flash on a microcontroller, bound to the
+// littlefs C library (littlefs-project/littlefs), vendored unchanged.
+//
+// This is the block a consumer writes to reach it:
+//
+//     dependencies {
+//       littlefs { git = "github.com/sysl-lang/littlefs", version = "<the first tag>" }
+//     }
+//
+// The module is `sh.sysl.littlefs`.
+
+package {
+  name    = "littlefs"
+  version = "0.0.1"
+}
+
+// **What littlefs is compiled with is this package's decision, not a consumer's.** Every option
+// below takes something out:
+//
+// - `LFS_NO_MALLOC`: littlefs never allocates. Every buffer it uses (the read and program caches,
+//   the lookahead bitmap, one cache per open file) is storage the binding hands it, so the package
+//   runs where there is no heap.
+// - `LFS_NO_DEBUG`, `LFS_NO_WARN`, `LFS_NO_ERROR`: no `printf` and no `<stdio.h>`. Errors reach a
+//   program as values, which is all a board can do with them anyway.
+// - `LFS_NO_ASSERT`: no `<assert.h>`. littlefs asserts on misuse of its API (a buffer of the wrong
+//   size, a block size that is not a multiple of the program size); the binding checks those before
+//   it calls, and answers `Error.Invalid`.
+defines {
+  "sh/sysl/littlefs/c/{lfs,lfs_util}.c" {
+    LFS_NO_MALLOC = true
+    LFS_NO_DEBUG  = true
+    LFS_NO_WARN   = true
+    LFS_NO_ERROR  = true
+    LFS_NO_ASSERT = true
+  }
+}

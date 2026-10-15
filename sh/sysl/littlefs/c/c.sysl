@@ -1,0 +1,210 @@
+// littlefs as C declares it.
+//
+// **Everything that is C lives in this directory**: the four files as they come from upstream, and this
+// file of declarations over them. Nothing here is meant to be called by a program. Every path is a
+// NUL-terminated `*u8`, every answer is a negative error code or a count, and every handle is storage
+// whose address littlefs keeps. The module above turns those into strings, `Result`s and methods, and
+// is what an application imports.
+//
+// Each declaration below was read out of `lfs.h`. A signature that disagrees with the header links and
+// then corrupts the call, so the layouts sysl declares itself (`Config`, `Info`, `FsInfo`, `Attr`,
+// `FileConfig`) are checked field by field against the header's own `offsetof` in the tests.
+
+module sh.sysl.littlefs.c
+
+@include("lfs.h")
+@include("stddef.h")
+
+// What every function answers when it fails. These are negated POSIX numbers, so the header is asked
+// for each one rather than trusted to agree with any particular `errno.h`.
+c const
+    ERR_OK:          int = "LFS_ERR_OK"
+    ERR_IO:          int = "LFS_ERR_IO"
+    ERR_CORRUPT:     int = "LFS_ERR_CORRUPT"
+    ERR_NOENT:       int = "LFS_ERR_NOENT"
+    ERR_EXIST:       int = "LFS_ERR_EXIST"
+    ERR_NOTDIR:      int = "LFS_ERR_NOTDIR"
+    ERR_ISDIR:       int = "LFS_ERR_ISDIR"
+    ERR_NOTEMPTY:    int = "LFS_ERR_NOTEMPTY"
+    ERR_BADF:        int = "LFS_ERR_BADF"
+    ERR_FBIG:        int = "LFS_ERR_FBIG"
+    ERR_INVAL:       int = "LFS_ERR_INVAL"
+    ERR_NOSPC:       int = "LFS_ERR_NOSPC"
+    ERR_NOMEM:       int = "LFS_ERR_NOMEM"
+    ERR_NOATTR:      int = "LFS_ERR_NOATTR"
+    ERR_NAMETOOLONG: int = "LFS_ERR_NAMETOOLONG"
+
+// The two kinds of entry a directory holds.
+c const
+    TYPE_REG: u8 = "LFS_TYPE_REG"
+    TYPE_DIR: u8 = "LFS_TYPE_DIR"
+
+// How a file is opened: one of the first three, with any of the rest.
+c const
+    O_RDONLY: int = "LFS_O_RDONLY"
+    O_WRONLY: int = "LFS_O_WRONLY"
+    O_RDWR:   int = "LFS_O_RDWR"
+    O_CREAT:  int = "LFS_O_CREAT"
+    O_EXCL:   int = "LFS_O_EXCL"
+    O_TRUNC:  int = "LFS_O_TRUNC"
+    O_APPEND: int = "LFS_O_APPEND"
+
+c const
+    SEEK_SET: int = "LFS_SEEK_SET"
+    SEEK_CUR: int = "LFS_SEEK_CUR"
+    SEEK_END: int = "LFS_SEEK_END"
+
+// The limits littlefs was compiled with. A name in `Info` has room for `NAME_MAX` bytes and its NUL.
+c const
+    NAME_MAX:     u32 = "LFS_NAME_MAX"
+    FILE_MAX:     u32 = "LFS_FILE_MAX"
+    ATTR_MAX:     u32 = "LFS_ATTR_MAX"
+    VERSION:      u32 = "LFS_VERSION"
+    DISK_VERSION: u32 = "LFS_DISK_VERSION"
+
+// The three handles littlefs keeps the addresses of. Their layouts are littlefs's business, so sysl
+// holds each as words of the size the header says, and never looks inside.
+c const
+    LFS_SIZE:   usize = "sizeof(lfs_t)"
+    LFS_ALIGN:  usize = "_Alignof(lfs_t)"
+    FILE_SIZE:  usize = "sizeof(lfs_file_t)"
+    FILE_ALIGN: usize = "_Alignof(lfs_file_t)"
+    DIR_SIZE:   usize = "sizeof(lfs_dir_t)"
+    DIR_ALIGN:  usize = "_Alignof(lfs_dir_t)"
+
+// Opaque stand-ins for the handles, so a pointer to one says which it is.
+struct Lfs
+    private word: u64
+
+struct File
+    private word: u64
+
+struct Dir
+    private word: u64
+
+// `struct lfs_config`, field for field. littlefs keeps a pointer to it for as long as the filesystem
+// is mounted, and calls the four functions with that pointer, which is how a callback finds its
+// device: `context` holds the device's address.
+struct Config
+    context: *u8
+    read: *extern(*Config, u32, u32, *u8, u32) -> i32
+    prog: *extern(*Config, u32, u32, *u8, u32) -> i32
+    erase: *extern(*Config, u32) -> i32
+    sync: *extern(*Config) -> i32
+    read_size: u32
+    prog_size: u32
+    block_size: u32
+    block_count: u32
+    block_cycles: i32
+    cache_size: u32
+    lookahead_size: u32
+    compact_thresh: u32
+    read_buffer: *u8
+    prog_buffer: *u8
+    lookahead_buffer: *u8
+    name_max: u32
+    file_max: u32
+    attr_max: u32
+    metadata_max: u32
+    inline_max: u32
+
+// The header's own measure of `Config`, which the tests compare with sysl's.
+c const
+    CONFIG_SIZE:             usize = "sizeof(struct lfs_config)"
+    CONFIG_READ_SIZE:        usize = "offsetof(struct lfs_config, read_size)"
+    CONFIG_BLOCK_CYCLES:     usize = "offsetof(struct lfs_config, block_cycles)"
+    CONFIG_COMPACT_THRESH:   usize = "offsetof(struct lfs_config, compact_thresh)"
+    CONFIG_READ_BUFFER:      usize = "offsetof(struct lfs_config, read_buffer)"
+    CONFIG_LOOKAHEAD_BUFFER: usize = "offsetof(struct lfs_config, lookahead_buffer)"
+    CONFIG_NAME_MAX:         usize = "offsetof(struct lfs_config, name_max)"
+    CONFIG_INLINE_MAX:       usize = "offsetof(struct lfs_config, inline_max)"
+
+// `struct lfs_info`: one directory entry, or what `stat` found.
+struct Info
+    kind: u8
+    size: u32
+    name: [256]u8
+
+c const
+    INFO_SIZE: usize = "sizeof(struct lfs_info)"
+    INFO_NAME: usize = "offsetof(struct lfs_info, name)"
+
+// `struct lfs_fsinfo`: what a mounted filesystem says about itself.
+struct FsInfo
+    disk_version: u32
+    block_size: u32
+    block_count: u32
+    name_max: u32
+    file_max: u32
+    attr_max: u32
+
+c const
+    FSINFO_SIZE: usize = "sizeof(struct lfs_fsinfo)"
+
+// `struct lfs_file_config`: the open file's cache, and the attributes written with it.
+struct FileConfig
+    buffer: *u8
+    attrs: *u8
+    attr_count: u32
+
+c const
+    FILE_CONFIG_SIZE:       usize = "sizeof(struct lfs_file_config)"
+    FILE_CONFIG_ATTR_COUNT: usize = "offsetof(struct lfs_file_config, attr_count)"
+
+// **Every layout sysl declares is checked against the header's when the package is compiled**, for
+// whichever target that is. A disagreement would link and then hand littlefs a configuration with its
+// fields shifted, so it is refused here instead.
+@assert(sizeof(Config) == CONFIG_SIZE, "sysl's Config is not the size of 'struct lfs_config'")
+@assert(offsetof(Config, read_size) == CONFIG_READ_SIZE, "Config.read_size is not where 'struct lfs_config' has it")
+@assert(offsetof(Config, block_cycles) == CONFIG_BLOCK_CYCLES, "Config.block_cycles is not where 'struct lfs_config' has it")
+@assert(offsetof(Config, compact_thresh) == CONFIG_COMPACT_THRESH, "Config.compact_thresh is not where 'struct lfs_config' has it")
+@assert(offsetof(Config, read_buffer) == CONFIG_READ_BUFFER, "Config.read_buffer is not where 'struct lfs_config' has it")
+@assert(offsetof(Config, lookahead_buffer) == CONFIG_LOOKAHEAD_BUFFER, "Config.lookahead_buffer is not where 'struct lfs_config' has it")
+@assert(offsetof(Config, name_max) == CONFIG_NAME_MAX, "Config.name_max is not where 'struct lfs_config' has it")
+@assert(offsetof(Config, inline_max) == CONFIG_INLINE_MAX, "Config.inline_max is not where 'struct lfs_config' has it")
+@assert(sizeof(Info) == INFO_SIZE, "sysl's Info is not the size of 'struct lfs_info'")
+@assert(offsetof(Info, name) == INFO_NAME, "Info.name is not where 'struct lfs_info' has it")
+@assert(sizeof(FsInfo) == FSINFO_SIZE, "sysl's FsInfo is not the size of 'struct lfs_fsinfo'")
+@assert(sizeof(FileConfig) == FILE_CONFIG_SIZE, "sysl's FileConfig is not the size of 'struct lfs_file_config'")
+@assert(offsetof(FileConfig, attr_count) == FILE_CONFIG_ATTR_COUNT, "FileConfig.attr_count is not where 'struct lfs_file_config' has it")
+
+// The handles are held as arrays of `u64`, which are 8-aligned. One that wants more is refused.
+@assert(LFS_ALIGN <= 8, "'lfs_t' wants a stronger alignment than an array of u64 gives")
+@assert(FILE_ALIGN <= 8, "'lfs_file_t' wants a stronger alignment than an array of u64 gives")
+@assert(DIR_ALIGN <= 8, "'lfs_dir_t' wants a stronger alignment than an array of u64 gives")
+
+// The filesystem.
+extern "lfs_format" format(lfs: *Lfs, config: *Config) -> int
+extern "lfs_mount" mount(lfs: *Lfs, config: *Config) -> int
+extern "lfs_unmount" unmount(lfs: *Lfs) -> int
+extern "lfs_fs_stat" fs_stat(lfs: *Lfs, info: *FsInfo) -> int
+extern "lfs_fs_size" fs_size(lfs: *Lfs) -> i32
+extern "lfs_fs_gc" fs_gc(lfs: *Lfs) -> int
+extern "lfs_fs_grow" fs_grow(lfs: *Lfs, block_count: u32) -> int
+
+// Entries by path.
+extern "lfs_remove" remove(lfs: *Lfs, path: *u8) -> int
+extern "lfs_rename" rename(lfs: *Lfs, old_path: *u8, new_path: *u8) -> int
+extern "lfs_stat" stat(lfs: *Lfs, path: *u8, info: *Info) -> int
+extern "lfs_mkdir" mkdir(lfs: *Lfs, path: *u8) -> int
+extern "lfs_getattr" getattr(lfs: *Lfs, path: *u8, kind: u8, buffer: *u8, size: u32) -> i32
+extern "lfs_setattr" setattr(lfs: *Lfs, path: *u8, kind: u8, buffer: *u8, size: u32) -> int
+extern "lfs_removeattr" removeattr(lfs: *Lfs, path: *u8, kind: u8) -> int
+
+// Files.
+extern "lfs_file_opencfg" file_opencfg(lfs: *Lfs, file: *File, path: *u8, flags: int,
+                                         config: *FileConfig) -> int
+extern "lfs_file_close" file_close(lfs: *Lfs, file: *File) -> int
+extern "lfs_file_sync" file_sync(lfs: *Lfs, file: *File) -> int
+extern "lfs_file_read" file_read(lfs: *Lfs, file: *File, buffer: *u8, size: u32) -> i32
+extern "lfs_file_write" file_write(lfs: *Lfs, file: *File, buffer: *u8, size: u32) -> i32
+extern "lfs_file_seek" file_seek(lfs: *Lfs, file: *File, off: i32, whence: int) -> i32
+extern "lfs_file_truncate" file_truncate(lfs: *Lfs, file: *File, size: u32) -> int
+extern "lfs_file_tell" file_tell(lfs: *Lfs, file: *File) -> i32
+extern "lfs_file_size" file_size(lfs: *Lfs, file: *File) -> i32
+
+// Directories.
+extern "lfs_dir_open" dir_open(lfs: *Lfs, dir: *Dir, path: *u8) -> int
+extern "lfs_dir_close" dir_close(lfs: *Lfs, dir: *Dir) -> int
+extern "lfs_dir_read" dir_read(lfs: *Lfs, dir: *Dir, info: *Info) -> int
+extern "lfs_dir_rewind" dir_rewind(lfs: *Lfs, dir: *Dir) -> int

@@ -1,0 +1,621 @@
+module sh.sysl.littlefs
+@tests
+@requires(heap, os)
+
+import sh.sysl.littlefs.c
+import sysl.buf.{Buf, buf}
+import sysl.text.from_utf8_unchecked
+
+// The binding over the RAM device, which behaves as NOR flash: erased bytes are 0xff and programming
+// only clears bits, so a filesystem that programmed a block it had not erased would read back wrong.
+// The devices below wrap it to lose power after a set number of writes, to wear blocks out, and to
+// count erases.
+
+private const BLOCK: u32 = 512
+private const BLOCKS: u32 = 64
+
+private geometry(cycles: i32 = 500) -> Geometry = Geometry(8, 16, BLOCK, BLOCKS, cycles)
+
+private fresh(dev: *RamDevice) -> Fs[RamDevice, 64, 16]
+    var fs: Fs[RamDevice, 64, 16] = filesystem(dev, geometry())
+    fs.format().unwrap()
+    fs.mount().unwrap()
+    fs
+
+private put(fs: *Fs[RamDevice, 64, 16], path: string, text: string)
+    var f: File[64] = file()
+    fs.open(&f, path, WRITE | CREATE | TRUNCATE).unwrap()
+    assert_eq(fs.write(&f, text.bytes).unwrap(), text.len)
+    fs.close(&f).unwrap()
+
+private get(fs: *Fs[RamDevice, 64, 16], path: string) -> string
+    var f: File[64] = file()
+    fs.open(&f, path, READ).unwrap()
+    var out: [256]u8 = [0; 256]
+    val n = fs.read(&f, out[..]).unwrap()
+    fs.close(&f).unwrap()
+    from_utf8_unchecked(out[0..<n])
+
+// Every name in the directory at `path`, in the order littlefs lists them, as "name/" for a directory
+// and "name:size" for a file.
+private listing(fs: *Fs[RamDevice, 64, 16], path: string) -> string
+    var d = dir()
+    fs.open_dir(&d, path).unwrap()
+    var e = info()
+    var out = ""
+    while fs.read_dir(&d, &e).unwrap()
+        val shown = if e.is_dir() then s"${e.name()}/" else s"${e.name()}:${e.size()}"
+        out = if out == "" then shown else s"${out} ${shown}"
+    fs.close_dir(&d).unwrap()
+    out
+
+// Byte `i` of a pattern no two nearby positions share, so a block in the wrong place reads wrong.
+private pattern(i: usize, seed: u8 = 0) -> u8 = u8((i * 31 + i / 251 + usize(seed)) % 256)
+
+@test("a file written to a formatted filesystem reads back after a remount")
+round_trip()
+    var dev = ram_device(BLOCK, BLOCKS)
+    var fs = fresh(&dev)
+    put(&fs, "hello.txt", "hello, flash")
+    fs.unmount().unwrap()
+    fs.mount().unwrap()
+    assert_eq(get(&fs, "hello.txt"), "hello, flash")
+
+@test("the layouts sysl declares are the header's, and the handles fit their words")
+layouts()
+    assert_eq(sizeof(c.Config), c.CONFIG_SIZE)
+    assert_eq(offsetof(c.Config, inline_max), c.CONFIG_INLINE_MAX)
+    assert_eq(sizeof(c.Info), c.INFO_SIZE)
+    assert_eq(sizeof(c.FsInfo), c.FSINFO_SIZE)
+    assert(LFS_WORDS * 8 >= c.LFS_SIZE)
+    assert(FILE_WORDS * 8 >= c.FILE_SIZE)
+    assert(DIR_WORDS * 8 >= c.DIR_SIZE)
+    assert_eq(c.NAME_MAX, 255)
+    assert_eq(c.VERSION, 0x0002000b)
+
+@test("a directory lists dot entries first, then directories and files with their sizes")
+directories()
+    var dev = ram_device(BLOCK, BLOCKS)
+    var fs = fresh(&dev)
+    fs.mkdir("docs").unwrap()
+    fs.mkdir("docs/deep").unwrap()
+    put(&fs, "docs/a.txt", "alpha")
+    put(&fs, "docs/b.txt", "be")
+    put(&fs, "top", "")
+    assert_eq(listing(&fs, "/"), "./ ../ docs/ top:0")
+    assert_eq(listing(&fs, "docs"), "./ ../ a.txt:5 b.txt:2 deep/")
+    assert_eq(listing(&fs, "docs/deep"), "./ ../")
+    assert_eq(get(&fs, "docs/a.txt"), "alpha")
+
+@test("rewinding a directory starts its listing over")
+rewind()
+    var dev = ram_device(BLOCK, BLOCKS)
+    var fs = fresh(&dev)
+    put(&fs, "one", "1")
+    var d = dir()
+    fs.open_dir(&d, "/").unwrap()
+    var e = info()
+    while fs.read_dir(&d, &e).unwrap()
+        ()
+    fs.rewind_dir(&d).unwrap()
+    assert(fs.read_dir(&d, &e).unwrap())
+    assert_eq(e.name(), ".")
+    fs.close_dir(&d).unwrap()
+
+@test("stat says what is at a path; exists says whether anything is")
+stat_and_exists()
+    var dev = ram_device(BLOCK, BLOCKS)
+    var fs = fresh(&dev)
+    fs.mkdir("d").unwrap()
+    put(&fs, "d/f", "twelve bytes")
+    var s = fs.stat("d/f").unwrap()
+    assert_eq(s.name(), "f")
+    assert_eq(s.size(), 12)
+    assert(!s.is_dir())
+    var t = fs.stat("d").unwrap()
+    assert(t.is_dir())
+    assert(fs.exists("d/f").unwrap())
+    assert(!fs.exists("d/nothing").unwrap())
+    assert_eq(fs.stat("nothing").err(), Some(Error.NotFound))
+
+@test("rename moves a file between directories and replaces what was at the new name")
+rename()
+    var dev = ram_device(BLOCK, BLOCKS)
+    var fs = fresh(&dev)
+    fs.mkdir("a").unwrap()
+    fs.mkdir("b").unwrap()
+    put(&fs, "a/x", "moved")
+    put(&fs, "b/y", "replaced")
+    fs.rename("a/x", "b/y").unwrap()
+    assert_eq(get(&fs, "b/y"), "moved")
+    assert(!fs.exists("a/x").unwrap())
+    fs.rename("b", "c").unwrap()
+    assert_eq(get(&fs, "c/y"), "moved")
+
+@test("remove takes a file or an empty directory, and refuses one that is not empty")
+remove()
+    var dev = ram_device(BLOCK, BLOCKS)
+    var fs = fresh(&dev)
+    fs.mkdir("d").unwrap()
+    put(&fs, "d/f", "x")
+    assert_eq(fs.remove("d").err(), Some(Error.NotEmpty))
+    fs.remove("d/f").unwrap()
+    fs.remove("d").unwrap()
+    assert_eq(listing(&fs, "/"), "./ ../")
+    assert_eq(fs.remove("d").err(), Some(Error.NotFound))
+
+@test("littlefs's own refusals arrive as the errors they name")
+refusals()
+    var dev = ram_device(BLOCK, BLOCKS)
+    var fs = fresh(&dev)
+    fs.mkdir("d").unwrap()
+    put(&fs, "f", "x")
+    var h: File[64] = file()
+    assert_eq(fs.open(&h, "missing", READ).err(), Some(Error.NotFound))
+    assert_eq(fs.open(&h, "f", WRITE | CREATE | EXCLUSIVE).err(), Some(Error.Exists))
+    assert_eq(fs.open(&h, "d", READ).err(), Some(Error.IsADirectory))
+    assert_eq(fs.mkdir("d").err(), Some(Error.Exists))
+    assert_eq(fs.mkdir("f/sub").err(), Some(Error.NotADirectory))
+    var d = dir()
+    assert_eq(fs.open_dir(&d, "f").err(), Some(Error.NotADirectory))
+    var long = ""
+    for _ in 0..<256
+        long = s"${long}n"
+    assert_eq(fs.mkdir(long).err(), Some(Error.NameTooLong))
+
+@test("a file opened for reading refuses a write, and one opened for writing refuses a read")
+modes()
+    var dev = ram_device(BLOCK, BLOCKS)
+    var fs = fresh(&dev)
+    put(&fs, "f", "contents")
+    var h: File[64] = file()
+    fs.open(&h, "f", READ).unwrap()
+    assert_eq(fs.write(&h, "no".bytes).err(), Some(Error.BadHandle))
+    fs.close(&h).unwrap()
+    fs.open(&h, "f", READ).unwrap()
+    assert_eq(fs.truncate(&h, 1).err(), Some(Error.BadHandle))
+    fs.close(&h).unwrap()
+    fs.open(&h, "f", WRITE).unwrap()
+    var out: [4]u8 = [0; 4]
+    assert_eq(fs.read(&h, out[..]).err(), Some(Error.BadHandle))
+    fs.close(&h).unwrap()
+    assert_eq(fs.open(&h, "f", CREATE).err(), Some(Error.Invalid))
+    assert_eq(get(&fs, "f"), "contents")
+
+@test("a filesystem that is not mounted refuses every operation but format and mount")
+unmounted()
+    var dev = ram_device(BLOCK, BLOCKS)
+    var fs = fresh(&dev)
+    assert_eq(fs.format().err(), Some(Error.Invalid))
+    fs.unmount().unwrap()
+    assert_eq(fs.unmount().err(), Some(Error.Invalid))
+    assert_eq(fs.mkdir("d").err(), Some(Error.Invalid))
+    assert_eq(fs.stat("d").err(), Some(Error.Invalid))
+    assert_eq(fs.used_blocks().err(), Some(Error.Invalid))
+    var h: File[64] = file()
+    assert_eq(fs.open(&h, "f", WRITE | CREATE).err(), Some(Error.Invalid))
+    var d = dir()
+    assert_eq(fs.open_dir(&d, "/").err(), Some(Error.Invalid))
+    fs.mount().unwrap()
+    fs.mkdir("d").unwrap()
+
+@test("the binding refuses what it cannot hand littlefs: a long path, a NUL, a handle used wrongly")
+binding_refusals()
+    var dev = ram_device(BLOCK, BLOCKS)
+    var fs = fresh(&dev)
+    var long = ""
+    for _ in 0..<MAX_PATH + 1
+        long = s"${long}p"
+    assert_eq(fs.stat(long).err(), Some(Error.PathTooLong))
+    assert_eq(fs.mkdir("a\u{0}b").err(), Some(Error.Invalid))
+    var h: File[64] = file()
+    var out: [4]u8 = [0; 4]
+    assert_eq(fs.read(&h, out[..]).err(), Some(Error.BadHandle))
+    assert_eq(fs.close(&h).err(), Some(Error.BadHandle))
+    fs.open(&h, "f", WRITE | CREATE).unwrap()
+    assert_eq(fs.open(&h, "g", WRITE | CREATE).err(), Some(Error.BadHandle))
+    fs.close(&h).unwrap()
+    var d = dir()
+    var e = info()
+    assert_eq(fs.read_dir(&d, &e).err(), Some(Error.BadHandle))
+    assert_eq(fs.mount().err(), Some(Error.Invalid))
+
+@test("a path of exactly MAX_PATH bytes is accepted")
+longest_path()
+    var dev = ram_device(BLOCK, BLOCKS)
+    var fs = fresh(&dev)
+    var name = ""
+    for _ in 0..<200
+        name = s"${name}n"
+    fs.mkdir(name).unwrap()
+    fs.mkdir(s"${name}/${name}").unwrap()
+    var rest = ""
+    for _ in 0..<MAX_PATH - 402
+        rest = s"${rest}r"
+    val path = s"${name}/${name}/${rest}"
+    assert_eq(path.len, MAX_PATH)
+    put(&fs, path, "deep")
+    assert_eq(get(&fs, path), "deep")
+
+@test("mounting a device with no filesystem on it is refused as corrupt")
+unformatted()
+    var dev = ram_device(BLOCK, BLOCKS)
+    var fs: Fs[RamDevice, 64, 16] = filesystem(&dev, geometry())
+    assert_eq(fs.mount().err(), Some(Error.Corrupt))
+    assert(!fs.is_mounted())
+
+@test("a file of many blocks reads back byte for byte, in pieces of any size")
+large_file()
+    var dev = ram_device(BLOCK, BLOCKS)
+    var fs = fresh(&dev)
+    val n = 9000usize
+    var data: Buf[u8] = buf()
+    for i in 0..<n
+        data.push(pattern(i))
+    var f: File[64] = file()
+    fs.open(&f, "big", WRITE | CREATE).unwrap()
+    var at = 0usize
+    while at < n
+        val piece = if n - at < 77 then n - at else 77
+        assert_eq(fs.write(&f, data.view()[at..<at + piece]).unwrap(), piece)
+        at += piece
+    fs.close(&f).unwrap()
+    fs.unmount().unwrap()
+    fs.mount().unwrap()
+    fs.open(&f, "big", READ).unwrap()
+    assert_eq(fs.size(&f).unwrap(), u32(n))
+    var out: [123]u8 = [0; 123]
+    var got = 0usize
+    loop
+        val k = fs.read(&f, out[..]).unwrap()
+        if k == 0 then break
+        for i in 0..<k
+            assert_eq(out[i], pattern(got + i))
+        got += k
+    assert_eq(got, n)
+    fs.close(&f).unwrap()
+
+@test("seek moves from the start, the current place or the end, and tell says where")
+seeking()
+    var dev = ram_device(BLOCK, BLOCKS)
+    var fs = fresh(&dev)
+    put(&fs, "f", "0123456789")
+    var f: File[64] = file()
+    fs.open(&f, "f", READ).unwrap()
+    assert_eq(fs.seek(&f, 3).unwrap(), 3)
+    var out: [2]u8 = [0; 2]
+    fs.read(&f, out[..]).unwrap()
+    assert_eq(from_utf8_unchecked(out[..]), "34")
+    assert_eq(fs.tell(&f).unwrap(), 5)
+    assert_eq(fs.seek(&f, 2, Whence.Current).unwrap(), 7)
+    assert_eq(fs.seek(&f, -1, Whence.End).unwrap(), 9)
+    fs.read(&f, out[..]).unwrap()
+    assert_eq(out[0], u8('9'))
+    assert_eq(fs.seek(&f, -20, Whence.Current).err(), Some(Error.Invalid))
+    fs.close(&f).unwrap()
+
+@test("truncate shortens a file, and lengthens one with zeros")
+truncating()
+    var dev = ram_device(BLOCK, BLOCKS)
+    var fs = fresh(&dev)
+    put(&fs, "f", "abcdef")
+    var f: File[64] = file()
+    fs.open(&f, "f", READ_WRITE).unwrap()
+    fs.truncate(&f, 3).unwrap()
+    assert_eq(fs.size(&f).unwrap(), 3)
+    fs.truncate(&f, 5).unwrap()
+    fs.close(&f).unwrap()
+    fs.open(&f, "f", READ).unwrap()
+    var out: [8]u8 = [7; 8]
+    assert_eq(fs.read(&f, out[..]).unwrap(), 5)
+    assert_eq(from_utf8_unchecked(out[0..<3]), "abc")
+    assert_eq(out[3], 0)
+    assert_eq(out[4], 0)
+    fs.close(&f).unwrap()
+
+@test("APPEND writes at the end wherever the file was, and TRUNCATE empties it on opening")
+append_and_truncate()
+    var dev = ram_device(BLOCK, BLOCKS)
+    var fs = fresh(&dev)
+    put(&fs, "log", "one")
+    var f: File[64] = file()
+    fs.open(&f, "log", WRITE | APPEND).unwrap()
+    fs.seek(&f, 0).unwrap()
+    fs.write(&f, " two".bytes).unwrap()
+    fs.close(&f).unwrap()
+    assert_eq(get(&fs, "log"), "one two")
+    fs.open(&f, "log", WRITE | TRUNCATE).unwrap()
+    fs.close(&f).unwrap()
+    assert_eq(get(&fs, "log"), "")
+
+@test("a flush makes a write durable while the file stays open")
+flushing()
+    var dev = ram_device(BLOCK, BLOCKS)
+    var fs = fresh(&dev)
+    var f: File[64] = file()
+    fs.open(&f, "f", WRITE | CREATE).unwrap()
+    fs.write(&f, "kept".bytes).unwrap()
+    fs.flush(&f).unwrap()
+    var second: Fs[RamDevice, 64, 16] = filesystem(&dev, geometry())
+    second.mount().unwrap()
+    assert_eq(get(&second, "f"), "kept")
+    second.unmount().unwrap()
+    fs.close(&f).unwrap()
+
+@test("two files open at once keep their own places and caches")
+two_files()
+    var dev = ram_device(BLOCK, BLOCKS)
+    var fs = fresh(&dev)
+    var a: File[64] = file()
+    var b: File[64] = file()
+    fs.open(&a, "a", WRITE | CREATE).unwrap()
+    fs.open(&b, "b", WRITE | CREATE).unwrap()
+    for i in 0..<100
+        fs.write(&a, "a".bytes).unwrap()
+        fs.write(&b, "bb".bytes).unwrap()
+    fs.close(&a).unwrap()
+    fs.close(&b).unwrap()
+    assert_eq(listing(&fs, "/"), "./ ../ a:100 b:200")
+
+@test("an attribute is set, read back, cut short to the buffer, and removed")
+attributes()
+    var dev = ram_device(BLOCK, BLOCKS)
+    var fs = fresh(&dev)
+    put(&fs, "f", "x")
+    fs.set_attribute("f", 7, "colour=blue".bytes).unwrap()
+    var out: [32]u8 = [0; 32]
+    val n = fs.get_attribute("f", 7, out[..]).unwrap()
+    assert_eq(from_utf8_unchecked(out[0..<n]), "colour=blue")
+    var short: [6]u8 = [0; 6]
+    fs.get_attribute("f", 7, short[..]).unwrap()
+    assert_eq(from_utf8_unchecked(short[..]), "colour")
+    assert_eq(fs.get_attribute("f", 8, out[..]).err(), Some(Error.NoAttribute))
+    fs.remove_attribute("f", 7).unwrap()
+    assert_eq(fs.get_attribute("f", 7, out[..]).err(), Some(Error.NoAttribute))
+    assert_eq(fs.set_attribute("missing", 7, "v".bytes).err(), Some(Error.NotFound))
+
+@test("the mounted filesystem reports its geometry, and the blocks it uses rise and fall")
+fs_reports()
+    var dev = ram_device(BLOCK, BLOCKS)
+    var fs = fresh(&dev)
+    val i = fs.fs_info().unwrap()
+    assert_eq(i.block_size, BLOCK)
+    assert_eq(i.block_count, BLOCKS)
+    assert_eq(i.name_max, 255)
+    assert_eq(i.disk_version, c.DISK_VERSION)
+    val empty = fs.used_blocks().unwrap()
+    var f: File[64] = file()
+    fs.open(&f, "big", WRITE | CREATE).unwrap()
+    for k in 0..<3000usize
+        var b: [1]u8 = [pattern(k)]
+        fs.write(&f, b[..]).unwrap()
+    fs.close(&f).unwrap()
+    val full = fs.used_blocks().unwrap()
+    assert(full >= empty + 5)
+    fs.remove("big").unwrap()
+    assert_eq(fs.used_blocks().unwrap(), empty)
+    fs.gc().unwrap()
+
+@test("a full device answers NoSpace, and the filesystem still works after it")
+full_device()
+    var dev = ram_device(BLOCK, BLOCKS)
+    var fs = fresh(&dev)
+    var f: File[64] = file()
+    fs.open(&f, "fill", WRITE | CREATE).unwrap()
+    var chunk: [64]u8 = [0x5a; 64]
+    var outcome: Result[usize, Error] = Ok(0)
+    for _ in 0..<2000
+        outcome = fs.write(&f, chunk[..])
+        if outcome.is_err() then break
+    assert_eq(outcome.err(), Some(Error.NoSpace))
+    fs.close(&f).err()
+    fs.remove("fill").unwrap()
+    put(&fs, "after", "room again")
+    assert_eq(get(&fs, "after"), "room again")
+
+@test("grow extends a filesystem onto blocks added to the device")
+growing()
+    var dev = ram_device(BLOCK, BLOCKS)
+    var fs: Fs[RamDevice, 64, 16] = filesystem(&dev, Geometry(16, 16, BLOCK, 32, 500))
+    fs.format().unwrap()
+    fs.mount().unwrap()
+    assert_eq(fs.fs_info().unwrap().block_count, 32)
+    fs.grow(BLOCKS).unwrap()
+    assert_eq(fs.fs_info().unwrap().block_count, BLOCKS)
+
+@test("a geometry littlefs would assert on is refused before it is called")
+bad_geometry()
+    var dev = ram_device(BLOCK, BLOCKS)
+    var odd_cache: Fs[RamDevice, 24, 16] = filesystem(&dev, geometry())
+    assert_eq(odd_cache.format().err(), Some(Error.Invalid))
+    var odd_lookahead: Fs[RamDevice, 64, 12] = filesystem(&dev, geometry())
+    assert_eq(odd_lookahead.format().err(), Some(Error.Invalid))
+    var no_blocks: Fs[RamDevice, 64, 16] = filesystem(&dev, Geometry(16, 16, BLOCK, 0, 500))
+    assert_eq(no_blocks.format().err(), Some(Error.Invalid))
+    var cache_past_block: Fs[RamDevice, 1024, 16] = filesystem(&dev, geometry())
+    assert_eq(cache_past_block.format().err(), Some(Error.Invalid))
+    var tiny_blocks: Fs[RamDevice, 64, 16] = filesystem(&dev, Geometry(16, 16, 64, 64, 500))
+    assert_eq(tiny_blocks.format().err(), Some(Error.Invalid))
+    var no_cycles: Fs[RamDevice, 64, 16] = filesystem(&dev, geometry(0))
+    assert_eq(no_cycles.format().err(), Some(Error.Invalid))
+    var fs: Fs[RamDevice, 64, 16] = filesystem(&dev, geometry())
+    fs.format().unwrap()
+    fs.mount().unwrap()
+    assert_eq(fs.grow(BLOCKS - 1).err(), Some(Error.Invalid))
+
+@test("names are bytes: UTF-8 names list back exactly as written")
+utf8_names()
+    var dev = ram_device(BLOCK, BLOCKS)
+    var fs = fresh(&dev)
+    put(&fs, "naïve—日本.txt", "u")
+    fs.mkdir("Ωmega").unwrap()
+    assert_eq(listing(&fs, "/"), "./ ../ naïve—日本.txt:1 Ωmega/")
+
+@test("a filesystem value moved before it is mounted works where it lands")
+moved_before_mount()
+    var dev = ram_device(BLOCK, BLOCKS)
+    var first: Fs[RamDevice, 64, 16] = filesystem(&dev, geometry())
+    first.format().unwrap()
+    var moved = first
+    moved.mount().unwrap()
+    put(&moved, "f", "fine")
+    assert_eq(get(&moved, "f"), "fine")
+
+// Flash that loses power: after `budget` programs and erases, every further one fails, as if the
+// supply had gone. A budget below 0 never runs out.
+private struct Flaky
+    ram: RamDevice
+    budget: int
+    used: int
+
+    private spend(*self) -> Result[unit, DeviceError]
+        if self.budget >= 0 && self.used >= self.budget then return Err(DeviceError.Io)
+        self.used += 1
+        Ok(())
+
+impl BlockDevice for Flaky
+    read(*self, block: u32, offset: u32, out: []u8) -> Result[unit, DeviceError] = self.ram.read(block, offset, out)
+
+    prog(*self, block: u32, offset: u32, data: []const u8) -> Result[unit, DeviceError]
+        self.spend()?
+        self.ram.prog(block, offset, data)
+
+    erase(*self, block: u32) -> Result[unit, DeviceError]
+        self.spend()?
+        self.ram.erase(block)
+
+    sync(*self) -> Result[unit, DeviceError] = self.ram.sync()
+
+private flaky_get(fs: *Fs[Flaky, 64, 16], path: string) -> string
+    var f: File[64] = file()
+    fs.open(&f, path, READ).unwrap()
+    var out: [1024]u8 = [0; 1024]
+    val n = fs.read(&f, out[..]).unwrap()
+    fs.close(&f).unwrap()
+    from_utf8_unchecked(out[0..<n])
+
+@test("power lost at every write of an update leaves the old file or the new one, never a mix")
+power_loss()
+    var old = ""
+    var new = ""
+    for i in 0..<600usize
+        old = s"${old}${i % 10}"
+        new = s"${new}${(i + 5) % 10}"
+    var budget = 0
+    loop
+        var dev = Flaky(ram_device(BLOCK, BLOCKS), -1, 0)
+        var setup: Fs[Flaky, 64, 16] = filesystem(&dev, geometry())
+        setup.format().unwrap()
+        setup.mount().unwrap()
+        var f: File[64] = file()
+        setup.open(&f, "doc", WRITE | CREATE).unwrap()
+        setup.write(&f, old.bytes).unwrap()
+        setup.close(&f).unwrap()
+        setup.unmount().unwrap()
+
+        dev.budget = budget
+        dev.used = 0
+        var fs: Fs[Flaky, 64, 16] = filesystem(&dev, geometry())
+        var finished = false
+        if fs.mount().is_ok() then
+            var g: File[64] = file()
+            if fs.open(&g, "doc", WRITE | TRUNCATE).is_ok() then
+                val wrote = fs.write(&g, new.bytes).is_ok()
+                finished = fs.close(&g).is_ok() && wrote
+
+        dev.budget = -1
+        var after: Fs[Flaky, 64, 16] = filesystem(&dev, geometry())
+        after.mount().unwrap()
+        val got = flaky_get(&after, "doc")
+        assert(got == old || got == new, s"with power lost after ${budget} writes the file read back as neither version")
+        if finished then
+            assert_eq(got, new)
+            break
+        budget += 1
+    assert(budget > 5)
+
+// Flash with one block worn out: programming or erasing it fails as a bad block would.
+private struct Worn
+    ram: RamDevice
+    bad: u32
+    refusals: int
+
+impl BlockDevice for Worn
+    read(*self, block: u32, offset: u32, out: []u8) -> Result[unit, DeviceError] = self.ram.read(block, offset, out)
+
+    prog(*self, block: u32, offset: u32, data: []const u8) -> Result[unit, DeviceError]
+        if block == self.bad then
+            self.refusals += 1
+            return Err(DeviceError.BadBlock)
+        self.ram.prog(block, offset, data)
+
+    erase(*self, block: u32) -> Result[unit, DeviceError]
+        if block == self.bad then
+            self.refusals += 1
+            return Err(DeviceError.BadBlock)
+        self.ram.erase(block)
+
+    sync(*self) -> Result[unit, DeviceError] = self.ram.sync()
+
+@test("a block that wears out is passed over, and the data lands elsewhere intact")
+bad_block()
+    var dev = Worn(ram_device(BLOCK, BLOCKS), 5, 0)
+    var fs: Fs[Worn, 64, 16] = filesystem(&dev, geometry())
+    fs.format().unwrap()
+    fs.mount().unwrap()
+    var f: File[64] = file()
+    fs.open(&f, "big", WRITE | CREATE).unwrap()
+    for k in 0..<12000usize
+        var b: [1]u8 = [pattern(k, 9)]
+        fs.write(&f, b[..]).unwrap()
+    fs.close(&f).unwrap()
+    fs.unmount().unwrap()
+    assert(dev.refusals > 0)
+    fs.mount().unwrap()
+    fs.open(&f, "big", READ).unwrap()
+    var out: [100]u8 = [0; 100]
+    var got = 0usize
+    loop
+        val k = fs.read(&f, out[..]).unwrap()
+        if k == 0 then break
+        for i in 0..<k
+            assert_eq(out[i], pattern(got + i, 9))
+        got += k
+    assert_eq(got, 12000)
+
+// Flash that counts the erases of each block.
+private struct Counting
+    ram: RamDevice
+    erases: [64]u32
+
+impl BlockDevice for Counting
+    read(*self, block: u32, offset: u32, out: []u8) -> Result[unit, DeviceError] = self.ram.read(block, offset, out)
+    prog(*self, block: u32, offset: u32, data: []const u8) -> Result[unit, DeviceError] = self.ram.prog(block, offset, data)
+
+    erase(*self, block: u32) -> Result[unit, DeviceError]
+        self.erases[usize(block)] += 1
+        self.ram.erase(block)
+
+    sync(*self) -> Result[unit, DeviceError] = self.ram.sync()
+
+// The most erases any one block took after rewriting one small file `rounds` times.
+private worst_wear(cycles: i32, rounds: int) -> u32
+    var dev = Counting(ram_device(BLOCK, BLOCKS), [0; 64])
+    var fs: Fs[Counting, 64, 16] = filesystem(&dev, geometry(cycles))
+    fs.format().unwrap()
+    fs.mount().unwrap()
+    var f: File[64] = file()
+    for r in 0..<rounds
+        fs.open(&f, "counter", WRITE | CREATE | TRUNCATE).unwrap()
+        fs.write(&f, s"round ${r}".bytes).unwrap()
+        fs.close(&f).unwrap()
+    var worst = 0u32
+    for n in dev.erases
+        if n > worst then worst = n
+    worst
+
+@test("wear levelling spreads the erases of a file rewritten over and over")
+wear_levelling()
+    val levelled = worst_wear(8, 2000)
+    val unlevelled = worst_wear(-1, 2000)
+    assert(levelled * 3 < unlevelled, s"worst block erased ${levelled} times with levelling, ${unlevelled} without")
