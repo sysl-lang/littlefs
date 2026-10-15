@@ -53,6 +53,9 @@ mounted works.
 
 **Status: accepted for alpha.14 as a `@pinned` struct attribute** (sysl branch `pinned`): a pinned
 value is never copied or moved by value. Assignment, by-value arguments, returns, captures,
-destructuring and by-value fields of a type that is not itself pinned are all refused. `Fs`, `File` and
-`Dir` take it when alpha.14 ships. Since a pinned value cannot be returned, `filesystem()` and `file()`
-become initialisers of storage the caller owns, and the moved-before-mount test goes.
+destructuring and by-value fields of a type that is not itself pinned are all refused. A function may
+still return a fresh pinned value, which is built in place in the caller's slot (C++17's guaranteed
+elision): the result may only initialize a fresh binding, a module `var` (folded, or placed at
+startup on a board), a `&T` box or a pinned parent's field. So `filesystem()`, `file()` and `dir()`
+keep their shape; `filesystem` is one of the branch's test cases. `Fs`, `File` and `Dir` take
+`@pinned` when alpha.14 ships, and the moved-before-mount test becomes a test that the move is refused.
