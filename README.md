@@ -3,6 +3,8 @@
 A small fail-safe filesystem for the flash on a microcontroller, bound to
 [littlefs](https://github.com/littlefs-project/littlefs) 2.11.3, vendored unchanged.
 
+*An independent sysl package for littlefs. It is not affiliated with or endorsed by littlefs's authors or trademark holders.*
+
 - **It survives power loss.** Every update is copy-on-write and commits atomically, so losing power in
   the middle of a write leaves the old version of a file or the new one, never a mix and never a broken
   filesystem.
