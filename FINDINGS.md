@@ -23,7 +23,7 @@ own package cache. Wanted: a package publishes include directories for the C of 
 depend on it. This is the cross-package half of the vendored-C manifest block asked for while
 probing TinyUSB, where a library's own include root could not be named either.
 
-**Status: fixed in sysl 0.1.1** (`c { headers { export = [...] } }`). Proved on 0.1.1: with `cstd` publishing `include/` as `libc` headers and a `cstd` dependency, `string.h` is found. Taking it into the package waits for `cstd` to publish them and be tagged; nothing was worked around meanwhile.
+**Status: fixed in sysl 0.1.1** (`c { headers { export = [...] } }`). Proved on 0.1.1: with `cstd` publishing `include/` as `libc` headers and a `cstd` dependency, `string.h` is found. Taken into the package in 0.1.1 with cstd v0.1.0: the suite builds the C for `thumbv7em-freestanding` and `riscv32-freestanding`. Nothing was worked around.
 
 ## 2. A dependency cannot be taken on some targets only (gap)
 
@@ -33,7 +33,7 @@ dependency only where the target has no C library" (Cargo's `[target.'cfg(…)'.
 Without it, littlefs either cannot name cstd at all, which leaves every bare-metal consumer to wire it
 by hand, or breaks every hosted build.
 
-**Status: fixed in sysl 0.1.1** (`cstd { ..., if = "!libc" }`); hosted builds were unaffected in the same probe. Adoption waits for a `cstd` tag; nothing was worked around meanwhile.
+**Status: fixed in sysl 0.1.1** (`cstd { ..., if = "!libc" }`); hosted builds were unaffected in the same probe. Adopted in 0.1.1 (`cstd` v0.1.0, `if = "!libc"`); nothing was worked around.
 
 ## 3. Nothing stops a struct being copied after C has taken its address (gap)
 

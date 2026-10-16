@@ -4,14 +4,20 @@
 // This is the block a consumer writes to reach it:
 //
 //     dependencies {
-//       littlefs { git = "github.com/sysl-lang/littlefs", version = "0.1.0" }
+//       littlefs { git = "github.com/sysl-lang/littlefs", version = "0.1.1" }
 //     }
 //
 // The module is `sh.sysl.littlefs`.
 
 package {
   name    = "littlefs"
-  version = "0.1.0"
+  version = "0.1.1"
+}
+
+// On a board there is no C library, so cstd supplies the one the vendored C includes by its system
+// names; on a hosted target the dependency is dropped and the system's libc answers.
+dependencies {
+  cstd { git = "github.com/sysl-lang/cstd", version = "0.1.0", if = "!libc" }
 }
 
 // **What littlefs is compiled with is this package's decision, not a consumer's.** Every option

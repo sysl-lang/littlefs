@@ -80,16 +80,18 @@ change, when something needs it.
 
 ## Bare metal
 
-The package needs no operating system and no allocator, but on a freestanding target littlefs's C
-needs a C library's headers and seven of its string functions, and today a sysl package has no way to
-hand it `sysl-lang/cstd`'s. sysl 0.1.1 can express that (a package publishes `c { headers { export } }`;
-a dependency takes `if = "!libc"`), but `cstd` has not yet published its headers or been tagged, so
-`sysl build-lib . --target thumb-freestanding` still stops at `'string.h' file not found`. A target with
-a C library (the Pico SDK's newlib, Zephyr, FreeRTOS) has the headers already.
+The package needs no operating system and no allocator. It builds for boards with `sysl-lang/cstd` as
+its C library: littlefs's C includes `<string.h>` and `<inttypes.h>` and calls seven string functions,
+and the manifest takes `cstd` with `if = "!libc"`, so on a freestanding target the C compiles against
+cstd's headers and the archive carries cstd's definitions, while on a hosted target the dependency is
+dropped and the system's libc answers. The suite builds `thumbv7em-freestanding` and
+`riscv32-freestanding` and checks with `nm` that each archive defines littlefs's entry points and the
+libc functions the C calls. This needs sysl 0.1.2 or later. A target with a C library of its own (the
+Pico SDK's newlib, Zephyr, FreeRTOS) has the headers already.
 
 ## Tests
 
-`sysl test .` runs 30 tests over a RAM device that behaves as NOR flash (erased bytes are 0xff and
+`sysl test .` runs 33 tests over a RAM device that behaves as NOR flash (erased bytes are 0xff and
 programming only clears bits). Beyond the operations and every error they can answer:
 
 - **Against littlefs driven from C.** A C program written straight against `lfs.h`, built from the same
