@@ -23,7 +23,7 @@ own package cache. Wanted: a package publishes include directories for the C of 
 depend on it. This is the cross-package half of the vendored-C manifest block asked for while
 probing TinyUSB, where a library's own include root could not be named either.
 
-**Status: accepted for alpha.14** (sysl branch `vendored-c`, with the TinyUSB block).
+**Status: fixed in sysl 0.1.1** (`c { headers { export = [...] } }`). Proved on 0.1.1: with `cstd` publishing `include/` as `libc` headers and a `cstd` dependency, `string.h` is found. Taking it into the package waits for `cstd` to publish them and be tagged; nothing was worked around meanwhile.
 
 ## 2. A dependency cannot be taken on some targets only (gap)
 
@@ -33,7 +33,7 @@ dependency only where the target has no C library" (Cargo's `[target.'cfg(…)'.
 Without it, littlefs either cannot name cstd at all, which leaves every bare-metal consumer to wire it
 by hand, or breaks every hosted build.
 
-**Status: accepted for alpha.14** (sysl branch `target-deps`).
+**Status: fixed in sysl 0.1.1** (`cstd { ..., if = "!libc" }`); hosted builds were unaffected in the same probe. Adoption waits for a `cstd` tag; nothing was worked around meanwhile.
 
 ## 3. Nothing stops a struct being copied after C has taken its address (gap)
 
@@ -51,11 +51,8 @@ Rust has `Pin`, C++ deletes the copy and move constructors. The package document
 `Fs`, an open `File`, an open `Dir` stay put) and has a test that a filesystem moved *before* it is
 mounted works.
 
-**Status: accepted for alpha.14 as a `@pinned` struct attribute** (sysl branch `pinned`): a pinned
-value is never copied or moved by value. Assignment, by-value arguments, returns, captures,
-destructuring and by-value fields of a type that is not itself pinned are all refused. A function may
-still return a fresh pinned value, which is built in place in the caller's slot (C++17's guaranteed
-elision): the result may only initialize a fresh binding, a module `var` (folded, or placed at
-startup on a board), a `&T` box or a pinned parent's field. So `filesystem()`, `file()` and `dir()`
-keep their shape; `filesystem` is one of the branch's test cases. `Fs`, `File` and `Dir` take
-`@pinned` when alpha.14 ships, and the moved-before-mount test becomes a test that the move is refused.
+**Status: fixed in sysl 0.1.1; workaround removed.** `Fs`, `File` and `Dir` are `@pinned`; `filesystem()`,
+`file()` and `dir()` keep their shape and build in place. Adopting it refused two things in the package's
+own tests (a helper returning a mounted `Fs`, and `var moved = first`), and three `(self)` receivers
+became `(*self)`. The moved-before-mount test is gone: a refusal is a compile error, which a `@test`
+cannot assert, and the compiler's own suite and the reference page pin it.

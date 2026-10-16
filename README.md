@@ -49,9 +49,9 @@ a multiple of 8, each byte covering 8 blocks. `Geometry` is the device's read, p
 its block count, and `block_cycles`: how many erases a metadata block takes before littlefs moves it
 (100 to 1000 is usual), or -1 for no wear levelling.
 
-**A mounted `Fs`, an open `File` and an open `Dir` must stay where they are**, because littlefs keeps
-their addresses. On a board they are module storage; a copy taken after `mount` or `open` is one
-littlefs knows nothing about. (sysl's coming `@pinned` will refuse such a copy: see FINDINGS 3.)
+**A mounted `Fs`, an open `File` and an open `Dir` stay where they are**, because littlefs keeps
+their addresses. All three are `@pinned`, so sysl refuses to copy or move one: build it where it lives
+(`var fs: Fs[...] = filesystem(...)`, a module `var`, or a `&` box) and reach it by `*self` or `&`.
 
 | | |
 |---|---|
@@ -82,8 +82,9 @@ change, when something needs it.
 
 The package needs no operating system and no allocator, but on a freestanding target littlefs's C
 needs a C library's headers and seven of its string functions, and today a sysl package has no way to
-hand it `sysl-lang/cstd`'s. Two sysl changes accepted for alpha.14 close that (FINDINGS 1 and 2); until
-then `sysl build-lib . --target thumb-freestanding` stops at `'string.h' file not found`. A target with
+hand it `sysl-lang/cstd`'s. sysl 0.1.1 can express that (a package publishes `c { headers { export } }`;
+a dependency takes `if = "!libc"`), but `cstd` has not yet published its headers or been tagged, so
+`sysl build-lib . --target thumb-freestanding` still stops at `'string.h' file not found`. A target with
 a C library (the Pico SDK's newlib, Zephyr, FreeRTOS) has the headers already.
 
 ## Tests

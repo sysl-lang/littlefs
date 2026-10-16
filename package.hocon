@@ -4,14 +4,14 @@
 // This is the block a consumer writes to reach it:
 //
 //     dependencies {
-//       littlefs { git = "github.com/sysl-lang/littlefs", version = "<the first tag>" }
+//       littlefs { git = "github.com/sysl-lang/littlefs", version = "0.1.0" }
 //     }
 //
 // The module is `sh.sysl.littlefs`.
 
 package {
   name    = "littlefs"
-  version = "0.0.1"
+  version = "0.1.0"
 }
 
 // **What littlefs is compiled with is this package's decision, not a consumer's.** Every option

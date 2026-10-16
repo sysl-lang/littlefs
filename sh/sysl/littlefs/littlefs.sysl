@@ -132,6 +132,7 @@ struct FsInfo
 
 // An open file. `CACHE` must be the filesystem's, which the type checks: a file is opened by an
 // `Fs[D, CACHE, L]` only if it is a `File[CACHE]`.
+@pinned
 struct File[const CACHE: usize]
     private state: [FILE_WORDS]u64
     private cache: [CACHE]u8
@@ -139,14 +140,15 @@ struct File[const CACHE: usize]
     private open: bool
     private flags: int
 
-    private readable(self) -> bool = self.open && self.flags & READ != 0
+    private readable(*self) -> bool = self.open && self.flags & READ != 0
 
-    private writable(self) -> bool = self.open && self.flags & WRITE != 0
+    private writable(*self) -> bool = self.open && self.flags & WRITE != 0
 
 // A file that is not open yet.
 file[const CACHE: usize]() -> File[CACHE] = File([0; FILE_WORDS], [0; CACHE], c.FileConfig(null, null, 0), false, 0)
 
 // An open directory, read one entry at a time.
+@pinned
 struct Dir
     private state: [DIR_WORDS]u64
     private open: bool
@@ -158,6 +160,7 @@ dir() -> Dir = Dir([0; DIR_WORDS], false)
 // caches and of every open file's cache: a multiple of the read and program sizes that divides the
 // block size. `LOOKAHEAD` is the size of the allocator's bitmap, a multiple of 8; each byte covers 8
 // blocks.
+@pinned
 struct Fs[D: BlockDevice, const CACHE: usize, const LOOKAHEAD: usize]
     private state: [LFS_WORDS]u64
     private config: c.Config
@@ -190,7 +193,7 @@ struct Fs[D: BlockDevice, const CACHE: usize, const LOOKAHEAD: usize]
         self.mounted = false
         check(c.unmount(lfs))
 
-    is_mounted(self) -> bool = self.mounted
+    is_mounted(*self) -> bool = self.mounted
 
     // Make a directory.
     mkdir(*self, path: string) -> Result[unit, Error]
