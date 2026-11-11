@@ -31,14 +31,14 @@ impl BlockDevice for RamDevice
 
     prog(*self, block: u32, offset: u32, data: []const u8) -> Result[unit, DeviceError]
         val at = self.at(block, offset, data.len)?
-        val bytes = self.bytes.view()
+        val bytes = self.bytes.view_mut()
         for i in 0..<data.len
             bytes[at + i] &= data[i]
         Ok(())
 
     erase(*self, block: u32) -> Result[unit, DeviceError]
         val at = self.at(block, 0, usize(self.block_size))?
-        val bytes = self.bytes.view()
+        val bytes = self.bytes.view_mut()
         for i in at..<at + usize(self.block_size)
             bytes[i] = 0xff
         Ok(())
